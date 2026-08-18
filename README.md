@@ -1,0 +1,90 @@
+# Rain Alert Bot — PostgreSQL/PostGIS (Supabase)
+
+Telegram-бот на Node.js, що попереджає про наближення дощу для збереженої геолокації.
+Використовує **PostgreSQL (Supabase) з розширенням PostGIS**:
+
+- **`GEOGRAPHY(POINT, 4326)`** замість пари `lat`/`lon` float — правильний тип для координат на сфері.
+- **GIST-індекс** на локацію — швидкий просторовий пошук.
+- **KNN-оператор `<->`** та `ST_DWithin` — індексований пошук найближчих підписників
+  (функція `findSubscribersNear`).
+- **SQL-функція `cluster_subscribers()`** — кластеризація підписників по сітці ~12 км (0.11°)
+  прямо в БД (`GROUP BY`), а не циклом у JS.
+- **ENUM типи** (`chat_type_enum`, `alert_kind_enum`) — БД відхиляє некоректні значення.
+- **UNIQUE constraint** на `(chat_id, alert_kind, event_start)` — дедублікація на рівні БД.
+- **Batch-дедублікація** через `filter_unsent_subscribers()` / `mark_alerts_sent_batch()`
+  — 2 SQL-запити на кластер замість N запитів на кожного підписника.
+- **Тригер `set_updated_at()`** — автоматичне оновлення `updated_at`.
+- **`forecast_cache` таблиця** — кеш прогнозів у БД (переживає рестарт/redeploy,
+  спільний для кількох інстансів бота).
+- **Connection pooling (`pg.Pool`)** — Supabase direct (5432) або pgbouncer (6543).
+
+## Структура проєкту
+
+```
+rain-bot/
+├── package.json
+├── schema.sql          # виконати один раз у Supabase SQL Editor або через supabase db push
+├── .env                # створи з .env.example
+├── .gitignore
+├── index.js            # Express-сервер, webhook, cron, graceful shutdown
+├── bot.js              # Обробка команд і геолокації
+├── alerts.js           # Перевірка погоди й розсилка (batch-дедуплікація)
+├── weather.js          # Open-Meteo + кеш прогнозу в forecast_cache
+└── db.js               # Увесь SQL: pool, upsert, KNN, кластеризація
+```
+
+## Налаштування Supabase
+
+1. Створи проєкт на [supabase.com](https://supabase.com).
+2. Застосуй схему одним зі способів:
+   - **Supabase SQL Editor** → встав увесь вміст `schema.sql` → Run.
+   - Або через **Supabase CLI**:
+     ```bash
+     supabase login
+     supabase init
+     supabase link --project-ref <project-ref>
+     supabase db push
+     ```
+   PostGIS активується автоматично (`CREATE EXTENSION IF NOT EXISTS postgis`).
+3. `DATABASE_URL` — з **Project Settings → Database → Connection string**
+   (пряме з'єднання, порт 5432, або pooler Transaction mode, порт 6543).
+
+## Локальний запуск
+
+```bash
+npm install
+cp .env.example .env
+# заповни BOT_TOKEN і DATABASE_URL
+# для локального тесту USE_POLLING=true (без webhook і тунелю)
+npm run dev
+```
+
+При `USE_POLLING=true` бот сам опитує Telegram, webhook/тунель не потрібен.
+
+## Деплой на Render / Railway / Koyeb
+
+1. Запуш репозиторій у GitHub.
+2. Створи Web Service, команда старту: `npm start`.
+3. Додай змінні середовища з `.env.example` (BOT_TOKEN, DATABASE_URL, WEBHOOK_URL,
+   USE_POLLING=false).
+4. При старті бот сам зареєструє webhook (`bot.setWebHook`).
+
+⚠️ **Render free tier** засинає після ~15 хв без вхідних HTTP-запитів — це зіб'є регулярність
+cron-перевірки. Тримай сервіс «теплим» через UptimeRobot-пінг на `/health` (він же перевіряє
+з'єднання з Supabase), або обери Railway/Koyeb з always-on контейнером.
+
+## Змінні середовища
+
+| Змінна | Опис | Дефолт |
+|---|---|---|
+| `BOT_TOKEN` | Токен від @BotFather | — |
+| `DATABASE_URL` | Supabase connection string | — |
+| `PG_POOL_MAX` | Максимум з'єднань у пулі | `10` |
+| `WEBHOOK_URL` | Публічний URL сервісу (без `/webhook`) | — |
+| `USE_POLLING` | `true` локально, `false` у продакшені | `false` |
+| `SOON_WINDOW_HOURS` | За скільки годин попереджати про дощ | `3` |
+| `RAIN_THRESHOLD_MM` | Межа інтенсивності "справжнього" дощу (мм/год) | `0.3` |
+| `TIMEZONE` | Часовий пояс для форматування часу | `Europe/Kyiv` |
+| `CLUSTER_GRID_DEG` | Сітка кластеризації підписників (°) | `0.11` |
+| `FORECAST_CACHE_TTL_MIN` | TTL кешу прогнозу в БД (хв) | `60` |
+| `SEND_CONCURRENCY` | Паралельних воркерів розсилки | `10` |
