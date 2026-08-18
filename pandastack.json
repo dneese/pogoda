@@ -1,0 +1,5 @@
+{
+  "type": "node",
+  "installCommand": "npm install",
+  "startCommand": "npm start"
+}
