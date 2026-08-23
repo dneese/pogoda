@@ -5,6 +5,7 @@ const {
   markAlertsSentBatch,
   getChatMessages,
   upsertChatMessage,
+  getSettingsForChats,
   removeSubscriber,
   cleanupOldData
 } = require('./db');
@@ -16,7 +17,44 @@ const SUDDEN_MINUTES = parseInt(process.env.SUDDEN_MINUTES || '60', 10);
 const SEND_CONCURRENCY = parseInt(process.env.SEND_CONCURRENCY || '10', 10);
 const TZ = process.env.TIMEZONE || 'Europe/Kyiv';
 
-const EMOJI = { rain: '🌧', thunder: '⛈', urgent: '🚨' };
+// --- Мета даних про явища і рівні -------------------------------------
+// Рівні небезпеки за моделлю MeteoAlarm/CAP:
+//   1 → 🟡 жовтий (будьте уважні), 2 → 🟠 оранжевий (небезпечно),
+//   3 → 🔴 червоний (надзвичайна небезпека)
+const SEVERITY_META = {
+  1: { emoji: '🟡', label: 'Жовтий рівень небезпеки' },
+  2: { emoji: '🟠', label: 'Оранжевий рівень небезпеки' },
+  3: { emoji: '🔴', label: 'Червоний рівень небезпеки' }
+};
+
+// Короткі поради з безпеки — як в офіційних попередженнях: кожне
+// сповіщення має казати, ЩО РОБИТИ, а не лише ЩО відбувається.
+const KIND_META = {
+  rain:    { emoji: '🌧', name: 'Дощ',
+             tip: 'Візьміть парасольку, закладіть більше часу на дорогу.' },
+  thunder: { emoji: '⛈', name: 'Гроза',
+             tip: 'Перечекайте в приміщенні, подалі від вікон. Не ховайтеся під поодинокими деревами.' },
+  hail:    { emoji: '🌨', name: 'Град',
+             tip: 'Негайно сховайтеся в приміщенні або під надійним дахом. Защітьте автомобіль.' },
+  wind:    { emoji: '💨', name: 'Сильний вітер',
+             tip: 'Уникайте дерев, рекламних щитів і ЛЕП. Закрийте вікна та балкони.' },
+  snow:    { emoji: '❄️', name: 'Снігопад/хуртовина',
+             tip: 'На дорозі ожеледиця — пересуйтеся обережно, плануйте більше часу.' },
+  ice:     { emoji: '🧊', name: 'Ожеледиця (крижаний дощ)',
+             tip: 'Дороги та тротуари дуже слизькі. Взуття з нескользкою підошвою, обережно на сходах.' },
+  heat:    { emoji: '🔥', name: 'Спека',
+             tip: 'Пийте більше води, уникайте сонця 11:00–17:00. Ніколи не лишайте дітей у машині.' },
+  cold:    { emoji: '🥶', name: 'Сильний мороз',
+             tip: 'Одягайтеся багатошарово, обмежте перебування на вулиці. Слідкуйте за ознаками обмороження.' },
+  fog:     { emoji: '🌫', name: 'Туман',
+             tip: 'На дорозі — увімкніть протитуманні фари, тримайте дистанцію.' },
+  uv:      { emoji: '☀️', name: 'Високий УФ-індекс',
+             tip: "Користуйтеся SPF 30+, сонцезахисними окулярами. Не засмагайте в пік активності." }
+};
+
+function severityMeta(sev) {
+  return SEVERITY_META[sev] || SEVERITY_META[1];
+}
 
 // --- Форматування ----------------------------------------------------
 
@@ -65,9 +103,10 @@ function durationLabel(ev) {
   return hoursLabel(hours);
 }
 
-// Візуалізація інтенсивності: ▓▓░░ — 4-клітинна «шкала»
-function intensityBar(mm) {
-  const filled = mm >= 4 ? 4 : mm >= 2 ? 3 : mm >= 1 ? 2 : 1;
+// Візуалізація інтенсивності опадів: ▓▓░░ — 4-клітинна «шкала»
+function intensityBar(v, thresholds) {
+  const t = thresholds || [1, 2, 4];
+  const filled = v >= t[2] ? 4 : v >= t[1] ? 3 : v >= t[0] ? 2 : 1;
   return '▓'.repeat(filled) + '░'.repeat(4 - filled);
 }
 
@@ -75,18 +114,29 @@ function sha256(s) {
   return crypto.createHash('sha256').update(s).digest('hex');
 }
 
+// Деталі події для картки: максимум явища, що визначає kind.
+function eventDetails(ev) {
+  switch (ev.kind) {
+    case 'wind': return `пориви до ${Math.round(ev.maxGustMs)} м/с`;
+    case 'snow': return `${ev.maxSnowCm.toFixed(1)} см/год`;
+    case 'heat': return `відчувається як +${Math.round(ev.maxTappC)}°C`;
+    case 'cold': return `відчувається як ${Math.round(ev.minTappC)}°C`;
+    case 'uv':   return `УФ-індекс ${Math.round(ev.maxUv)}`;
+    case 'rain': return `${intensityBar(ev.maxMm)} до ${ev.maxMm.toFixed(1)} мм/год`;
+    default: return null;
+  }
+}
+
 // Рядок іміджент-події у картці
 function eventLine(ev, now) {
+  const meta = KIND_META[ev.kind] || KIND_META.rain;
+  const sev = severityMeta(ev.severity);
   const t = formatTime(ev.onset);
   const rel = relLabel(ev.onset.getTime() - now.getTime());
   const to = formatTime(ev.endTime);
-  if (ev.kind === 'urgent') {
-    return `${EMOJI.urgent} ${ev.description} — о **${t}** (${rel})`;
-  }
-  if (ev.kind === 'thunder') {
-    return `⛈ Гроза — о **${t}** (${rel}), триватиме до **${to}**`;
-  }
-  return `🌧 Дощ — о **${t}** (${rel}), триватиме до **${to}** · ${intensityBar(ev.maxMm)} ${ev.maxMm.toFixed(1)} мм/год`;
+  const det = eventDetails(ev);
+  const detPart = det ? ` · ${det}` : '';
+  return `${sev.emoji} ${meta.name} — о **${t}** (${rel}), до **${to}**${detPart}`;
 }
 
 // Rich Markdown-картка: іміджент + аутлук на кілька днів в одному
@@ -95,36 +145,46 @@ function eventLine(ev, now) {
 function buildCardContent({ imminent, outlook, now }) {
   const parts = [];
 
+  // Найвищий рівень серед іміджент-подій визначає заголовок картки
+  const maxSev = imminent.reduce((m, ev) => Math.max(m, ev.severity), 0);
+
   if (imminent.length > 0) {
     const lead = imminent[0];
-    if (lead.kind === 'urgent') parts.push(`# 🚨 Небезпека: ${lead.description}!`);
-    else if (lead.kind === 'thunder') parts.push('# ⛈ Гроза наближається!');
-    else parts.push('# 🌧 Дощ наближається!');
+    const leadMeta = KIND_META[lead.kind] || KIND_META.rain;
+    parts.push(`# ${severityMeta(maxSev).emoji} ${leadMeta.name} наближається!`);
+    if (maxSev >= 2) {
+      parts.push('');
+      parts.push(`**${severityMeta(maxSev).label}**`);
+    }
     parts.push('');
     for (const ev of imminent) parts.push(`> ${eventLine(ev, now)}`);
     parts.push('');
+    parts.push(`💡 ${leadMeta.tip}`);
+    parts.push('');
     parts.push('Прогноз уточнюється — це повідомлення оновлюється автоматично.');
   } else if (outlook.length > 0) {
-    parts.push('# ☔ Дощ найближчими днями');
+    parts.push('# 📅 Небезпечні явища найближчими днями');
     parts.push('');
-    parts.push('За 3 години до дощу уточню точний час окремим попередженням.');
+    parts.push('За 3 години до початку уточню час окремим попередженням.');
   } else {
-    parts.push('# ☀️ Дощу не очікується');
+    parts.push('# ☀️ Небезпечних явищ не очікується');
     parts.push('');
-    parts.push(`Найближчі ${Math.round(OUTLOOK_MAX_HOURS / 24)} дні — сухо.`);
+    parts.push(`Найближчі ${Math.round(OUTLOOK_MAX_HOURS / 24)} дні — спокійно.`);
   }
 
   if (outlook.length > 0) {
     parts.push('');
     parts.push('## Найближчі дні');
     parts.push('');
-    parts.push('| День | Коли | Тривалість | Інтенсивність |');
+    parts.push('| День | Явище | Коли | Деталі |');
     parts.push('| :-- | :-- | :-- | :-- |');
     for (const ev of outlook) {
+      const meta = KIND_META[ev.kind] || KIND_META.rain;
       const from = formatTime(ev.onset);
       const to = formatTime(ev.endTime);
+      const det = eventDetails(ev) || `${durationLabel(ev)}`;
       parts.push(
-        `| ${dayName(ev.onset)} | ${EMOJI[ev.kind]} ${from}–${to} | ${durationLabel(ev)} | ${intensityBar(ev.maxMm)} ${ev.maxMm.toFixed(1)} мм/год |`
+        `| ${dayName(ev.onset)} | ${severityMeta(ev.severity).emoji} ${meta.name} | ${from}–${to} | ${det} |`
       );
     }
   }
@@ -135,19 +195,64 @@ function buildCardContent({ imminent, outlook, now }) {
   return parts.join('\n');
 }
 
-// Нове повідомлення — тільки «раптовий дощ» (start в межах SUDDEN_MINUTES)
-// та ураган/град. Решта — редагування картки.
+// Нове push-повідомлення. Надсилається для червоних/оранжевих подій
+// завжди, для жовтих — якщо початок в межах SUDDEN_MINUTES.
+// Включає рівень небезпеки + конкретну пораду з безпеки.
 function buildSuddenText(ev, now) {
+  const meta = KIND_META[ev.kind] || KIND_META.rain;
+  const sev = severityMeta(ev.severity);
   const t = formatTime(ev.onset);
   const rel = relLabel(ev.onset.getTime() - now.getTime());
   const to = formatTime(ev.endTime);
-  if (ev.kind === 'urgent') {
-    return `# 🚨 ${ev.description}!\n\nОчікується о **${t}** (${rel}).\n\n> Терміново сховайтеся в безпечне місце!`;
+  const det = eventDetails(ev);
+  const detLine = det ? `\n\n📊 **${det}**` : '';
+
+  // 🔴 червоний — крик; 🟠/🟡 — спокійніше
+  const title = ev.severity >= 3
+    ? `${sev.emoji} ${meta.name.toUpperCase()} — НЕГАЙНО!`
+    : `${sev.emoji} ${sev.label}: ${meta.name}`;
+
+  return `${title}\n\n` +
+    `${meta.name} очікується о **${t}** (${rel}) і триватиме приблизно до **${to}**.` +
+    detLine +
+    `\n\n> 💡 ${meta.tip}`;
+}
+
+// --- Фільтр за налаштуваннями користувача -----------------------------
+// Кожен чат може: вимкнути категорії явищ, підняти мінімальний рівень
+// небезпеки та ввімкнути тихі години (🔴 червоні проходять завжди).
+
+function currentHourInTz(now = new Date()) {
+  return parseInt(
+    now.toLocaleString('en-GB', { hour: '2-digit', hour12: false, timeZone: TZ }),
+    10
+  );
+}
+
+function inQuietHours(settings, hour) {
+  if (!settings.quiet_enabled) return false;
+  const start = settings.quiet_start;
+  const end = settings.quiet_end;
+  if (start === end) return true; // увесь день
+  if (start < end) return hour >= start && hour < end;
+  return hour >= start || hour < end; // через північ
+}
+
+function isEventAllowed(ev, settings, now) {
+  if (settings.cats && !settings.cats.includes(ev.category)) {
+    stats.inc('alerts_suppressed_settings');
+    return false;
   }
-  if (ev.kind === 'thunder') {
-    return `# ⛈ Раптова гроза!\n\nГроза очікується о **${t}** (${rel}), триватиме до **${to}**.\n\n> Перечекайте вдома, подалі від вікон.`;
+  if (ev.severity < settings.min_severity) {
+    stats.inc('alerts_suppressed_settings');
+    return false;
   }
-  return `# 🌧 Раптовий дощ!\n\nДощ почнеться о **${t}** (${rel}) і триватиме до **${to}**.\n\n> Швидше зайдіть додому — і не забудьте парасольку!`;
+  // 🔴 червоний рівень — завжди пробиває тихі години
+  if (ev.severity < 3 && inQuietHours(settings, currentHourInTz(now))) {
+    stats.inc('alerts_suppressed_quiet');
+    return false;
+  }
+  return true;
 }
 
 // --- Виконання -------------------------------------------------------
@@ -199,7 +304,7 @@ async function runPool(items, fn, limit) {
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
   }
-  const workers = Array.from({ length: Math.min(limit, items.length) }, worker);
+  const workers = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, worker);
   await Promise.all(workers);
 }
 
@@ -222,7 +327,7 @@ async function sendRichConcurrently(bot, chatIds, markdown) {
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
   }
-  const workers = Array.from({ length: Math.min(SEND_CONCURRENCY, chatIds.length) }, worker);
+  const workers = Array.from({ length: Math.min(SEND_CONCURRENCY, Math.max(1, chatIds.length)) }, worker);
   await Promise.all(workers);
   await dropDeadChats(chatIds, dead);
   return sentIds;
@@ -284,17 +389,26 @@ async function updateCards(bot, chatIds, analysis) {
   await runPool(updated, (u) => upsertChatMessage(u.chatId, u.messageId, hash), SEND_CONCURRENCY);
 }
 
-// Нове 🚨-повідомлення: ураган/град завжди, решта — якщо подія
-// починається в межах SUDDEN_MINUTES. Дедуп через sent_alerts
+// Push-повідомлення про небезпечні явища. Дедуп через sent_alerts
 // (kind = kind події, ключ = годинний слот старту).
+// НОВЕ: фільтр за індивідуальними налаштуваннями чата — категорії,
+// мінімальний рівень небезпеки, тихі години.
 async function sendSuddenAlerts(bot, chatIds, analysis) {
   const now = analysis.now;
-  for (const ev of analysis.imminent) {
-    const isUrgent = ev.kind === 'urgent';
-    const isSudden = ev.onset.getTime() - now.getTime() <= SUDDEN_MINUTES * 60000;
-    if (!isUrgent && !isSudden) continue;
 
-    const toNotify = await filterUnsentSubscribers(chatIds, ev.kind, ev.startTime);
+  // Один запит на кластер замість запиту на кожну подію
+  const settingsMap = await getSettingsForChats(chatIds);
+
+  for (const ev of analysis.imminent) {
+    // Жовті події штовхаємо тільки якщо вони «раптові»; оранжеві й
+    // червоні — одразу, як тільки з'явилися в прогнозі.
+    if (ev.severity < 2 && ev.onset.getTime() - now.getTime() > SUDDEN_MINUTES * 60000) continue;
+
+    const unsent = await filterUnsentSubscribers(chatIds, ev.kind, ev.startTime);
+    if (unsent.length === 0) continue;
+
+    const toNotify = unsent.filter((chatId) =>
+      isEventAllowed(ev, settingsMap.get(String(chatId)) || {}, now));
     if (toNotify.length === 0) continue;
 
     const text = buildSuddenText(ev, now);
@@ -343,4 +457,11 @@ async function checkAndNotify(bot) {
   }
 }
 
-module.exports = { checkAndNotify, buildCardContent, buildSuddenText };
+module.exports = {
+  checkAndNotify,
+  buildCardContent,
+  buildSuddenText,
+  isEventAllowed,
+  KIND_META,
+  SEVERITY_META
+};

@@ -7,6 +7,8 @@ const counters = {
   forecast_cache_hits_mem: 0,
   forecast_errors: 0,
   sudden_alerts_sent: 0,
+  alerts_suppressed_settings: 0,
+  alerts_suppressed_quiet: 0,
   cards_created: 0,
   cards_updated: 0,
   telegram_send_errors: 0,

@@ -180,6 +180,87 @@ async function upsertChatMessage(chatId, messageId, contentHash) {
   await query(sql, [chatId, messageId, contentHash]);
 }
 
+// --- Налаштування користувача (/settings) -----------------------------
+// Дефолти в коді; у БД зберігаються лише явні зміни (sparse-рядок).
+const DEFAULT_SETTINGS = {
+  min_severity: 1,
+  quiet_enabled: false,
+  quiet_start: 23,
+  quiet_end: 7,
+  cats: ['precip', 'storm', 'wind', 'temp', 'other']
+};
+
+function normalizeSettings(row) {
+  if (!row) return { ...DEFAULT_SETTINGS };
+  return {
+    min_severity: row.min_severity != null ? row.min_severity : DEFAULT_SETTINGS.min_severity,
+    quiet_enabled: !!row.quiet_enabled,
+    quiet_start: row.quiet_start != null ? row.quiet_start : DEFAULT_SETTINGS.quiet_start,
+    quiet_end: row.quiet_end != null ? row.quiet_end : DEFAULT_SETTINGS.quiet_end,
+    cats: Array.isArray(row.cats) && row.cats.length > 0 ? row.cats : [...DEFAULT_SETTINGS.cats]
+  };
+}
+
+async function getUserSettings(chatId) {
+  const sql = `
+    SELECT min_severity, quiet_enabled, quiet_start, quiet_end, cats
+    FROM user_settings
+    WHERE chat_id = $1
+  `;
+  const { rows } = await query(sql, [chatId]);
+  return normalizeSettings(rows[0]);
+}
+
+// Один запит на весь кластер: Map<chatId(string), settings>
+async function getSettingsForChats(chatIds) {
+  const map = new Map();
+  if (!chatIds || chatIds.length === 0) return map;
+  const sql = `
+    SELECT chat_id, min_severity, quiet_enabled, quiet_start, quiet_end, cats
+    FROM user_settings
+    WHERE chat_id = ANY($1)
+  `;
+  const { rows } = await query(sql, [chatIds]);
+  for (const r of rows) {
+    map.set(String(r.chat_id), normalizeSettings(r));
+  }
+  return map;
+}
+
+// Часткове оновлення: передаються лише поля, які треба змінити.
+// Повертає повні нормалізовані налаштування після апдейта.
+async function upsertUserSettings(chatId, patch) {
+  const current = await getUserSettings(chatId);
+  const merged = { ...current, ...patch };
+
+  // Валідація значень — БД теж перевіряє (CHECK), але тут даємо м'яку нормалізацію
+  merged.min_severity = Math.min(3, Math.max(1, parseInt(merged.min_severity, 10) || 1));
+  merged.quiet_start = Math.min(23, Math.max(0, parseInt(merged.quiet_start, 10)));
+  merged.quiet_end = Math.min(23, Math.max(0, parseInt(merged.quiet_end, 10)));
+  const allowedCats = ['precip', 'storm', 'wind', 'temp', 'other'];
+  merged.cats = Array.isArray(merged.cats)
+    ? merged.cats.filter((c) => allowedCats.includes(c))
+    : [...DEFAULT_SETTINGS.cats];
+
+  const sql = `
+    INSERT INTO user_settings (chat_id, min_severity, quiet_enabled, quiet_start, quiet_end, cats)
+    VALUES ($1, $2, $3, $4, $5, $6)
+    ON CONFLICT (chat_id) DO UPDATE SET
+      min_severity = EXCLUDED.min_severity,
+      quiet_enabled = EXCLUDED.quiet_enabled,
+      quiet_start = EXCLUDED.quiet_start,
+      quiet_end = EXCLUDED.quiet_end,
+      cats = EXCLUDED.cats,
+      updated_at = now()
+    RETURNING min_severity, quiet_enabled, quiet_start, quiet_end, cats
+  `;
+  const { rows } = await query(sql, [
+    chatId, merged.min_severity, merged.quiet_enabled,
+    merged.quiet_start, merged.quiet_end, merged.cats
+  ]);
+  return normalizeSettings(rows[0]);
+}
+
 async function closePool() {
   await pool.end();
 }
@@ -201,6 +282,10 @@ module.exports = {
   setCachedForecast,
   getChatMessages,
   upsertChatMessage,
+  getUserSettings,
+  getSettingsForChats,
+  upsertUserSettings,
+  DEFAULT_SETTINGS,
   cleanupOldData,
   closePool
 };

@@ -1,7 +1,7 @@
 {
   "name": "rain-alert-bot",
-  "version": "2.1.0",
-  "description": "Telegram-бот на Node.js + PostgreSQL/PostGIS (Supabase), що попереджає про наближення дощу",
+  "version": "2.2.0",
+  "description": "Telegram-бот на Node.js + PostgreSQL/PostGIS (Supabase), що попереджає про екстремальні погодні явища",
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
