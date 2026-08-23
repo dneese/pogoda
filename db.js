@@ -1,4 +1,5 @@
 const { Pool } = require('pg');
+const log = require('./logger');
 
 // Supabase pgbouncer (transaction pooling) — правильний режим для
 // serverless/багатоінстансних деплоїв, не прямий порт 5432.
@@ -11,7 +12,7 @@ const pool = new Pool({
 });
 
 pool.on('error', (err) => {
-  console.error('Unexpected PG pool error:', err);
+  log.error('Unexpected PG pool error:', err);
 });
 
 async function query(text, params) {
@@ -56,6 +57,12 @@ async function findSubscriber(chatId) {
 async function removeSubscriber(chatId) {
   const { rowCount } = await query('DELETE FROM subscribers WHERE chat_id = $1', [chatId]);
   return rowCount > 0;
+}
+
+// Для /health та /metrics
+async function getSubscriberCount() {
+  const { rows } = await query('SELECT count(*)::int AS n FROM subscribers');
+  return rows[0] ? rows[0].n : 0;
 }
 
 // Кластеризація підписників по сітці ~12 км (0.11°, дефолт функції в БД).
@@ -184,6 +191,7 @@ module.exports = {
   upsertSubscriber,
   findSubscriber,
   removeSubscriber,
+  getSubscriberCount,
   getSubscriberClusters,
   findSubscribersNear,
   filterUnsentSubscribers,

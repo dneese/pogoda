@@ -18,6 +18,31 @@ Telegram-бот на Node.js, що попереджає про наближен�
   спільний для кількох інстансів бота).
 - **Connection pooling (`pg.Pool`)** — Supabase direct (5432) або pgbouncer (6543).
 
+## Що нового у v2.1
+
+- **Команда `/weather`** («☔ Поточний прогноз») — свіжа прогноз-картка на запит, без очікування циклу.
+- **`/help`, `/subscribe`, `/unsubscribe`** — повний набір команд + підказка на невідомі команди.
+- **L1-кеш прогнозу в пам'яті** перед DB-кешем — менше round-trip'ів до Supabase.
+- **Ретраї з backoff та таймаутом** для Open-Meteo (нативний `fetch`, залежність `node-fetch` прибрана).
+- **Структурний логер** (`logger.js`) з рівнями (`LOG_LEVEL=debug|info|warn|error`).
+- **`/metrics`** — лічильники runtime (fetch/кеш/помилки/розсилки) у JSON.
+- **Розширений `/health`**: uptime, версія, кількість підписників (старі ключі збережені).
+- **Секрет вебхуку** (`TELEGRAM_WEBHOOK_SECRET`, генерується автоматично) + перевірка заголовка Telegram.
+- **Антифlood** — обмеження повідомлень з одного чату (`RATE_LIMIT_MSGS`).
+- **Авточистка мертвих чатів**: заблокували бота → підписник видаляється, помилки не повторюються.
+- **Захист від накладання cron-циклів**, `cleanupOldData()` раз на годину замість кожні 5 хв.
+- **Fail-fast валідація конфігу** при старті; коректний graceful shutdown (зняття вебхуку, стоп polling).
+
+## Команди бота
+
+| Команда | Дія |
+|---|---|
+| `/start` | Привітання + клавіатура |
+| `/weather` | Прогноз-картка для збереженої локації |
+| `/help` | Список команд |
+| `/subscribe` | Підписка (запит геолокації) |
+| `/unsubscribe` | Скасувати підписку |
+
 ## Структура проєкту
 
 ```
@@ -26,11 +51,13 @@ rain-bot/
 ├── schema.sql          # виконати один раз у Supabase SQL Editor або через supabase db push
 ├── .env                # створи з .env.example
 ├── .gitignore
-├── index.js            # Express-сервер, webhook, cron, graceful shutdown
-├── bot.js              # Обробка команд і геолокації
-├── alerts.js           # Перевірка погоди й розсилка (batch-дедуплікація)
-├── weather.js          # Open-Meteo + кеш прогнозу в forecast_cache
-└── db.js               # Увесь SQL: pool, upsert, KNN, кластеризація
+├── index.js            # Express-сервер, webhook, cron, /health, /metrics, graceful shutdown
+├── bot.js              # Обробка команд і геолокації, антифlood
+├── alerts.js           # Перевірка погоди й розсилка (batch-дедублікація)
+├── weather.js          # Open-Meteo: нативний fetch + ретраї, L1+L2 кеші
+├── db.js               # Увесь SQL: pool, upsert, KNN, кластеризація
+├── logger.js           # Мінімалістичний структурний логер
+└── stats.js            # Лічильники для /health та /metrics
 ```
 
 ## Налаштування Supabase
@@ -88,3 +115,9 @@ cron-перевірки. Тримай сервіс «теплим» через U
 | `CLUSTER_GRID_DEG` | Сітка кластеризації підписників (°) | `0.11` |
 | `FORECAST_CACHE_TTL_MIN` | TTL кешу прогнозу в БД (хв) | `60` |
 | `SEND_CONCURRENCY` | Паралельних воркерів розсилки | `10` |
+| `LOG_LEVEL` | Рівень логування `debug/info/warn/error` | `info` |
+| `TELEGRAM_WEBHOOK_SECRET` | Секрет перевірки вебхуку; порожньо = автогенерація | — |
+| `OPEN_METEO_TIMEOUT_MS` | Таймаут запиту до Open-Meteo | `15000` |
+| `OPEN_METEO_RETRIES` | Кількість ретраїв Open-Meteo | `2` |
+| `RATE_LIMIT_MSGS` | Максимум повідомлень з чату за хвилину | `20` |
+| `URGENT_WIND_MS` | Пориви вітру (м/с) для класу «ураган» | `25` |

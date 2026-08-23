@@ -1,5 +1,12 @@
-const fetch = require('node-fetch');
 const { getForecastEntry, setCachedForecast } = require('./db');
+const log = require('./logger');
+const stats = require('./stats');
+
+// L1-кеш у пам'яті процесу перед DB-кешем: економить round-trip до Supabase
+// у межах одного інстансу. TTL збігається з FORECAST_CACHE_TTL_MIN.
+const FETCH_TIMEOUT_MS = parseInt(process.env.OPEN_METEO_TIMEOUT_MS || '15000', 10);
+const FETCH_RETRIES = parseInt(process.env.OPEN_METEO_RETRIES || '2', 10);
+const memCache = new Map(); // clusterKey -> { payload, fetchedAt }
 
 const RAIN_CODES = [51, 53, 55, 61, 63, 65, 80, 81, 82];
 const THUNDER_CODES = [95, 97];
@@ -41,39 +48,71 @@ function timeParser(forecastJson) {
 async function getForecast(lat, lon) {
   const key = clusterKeyOf(lat, lon);
 
+  // L1: пам'ять процесу
+  const mem = memCache.get(key);
+  if (mem) {
+    const ageMin = (Date.now() - mem.fetchedAt) / 60000;
+    const needFresh = hasNearActivity(mem.payload, SOON_WINDOW_HOURS + 1) &&
+      ageMin >= IMMINENT_TTL_MINUTES;
+    if (ageMin < CACHE_TTL_MINUTES && !needFresh) {
+      stats.inc('forecast_cache_hits_mem');
+      return mem.payload;
+    }
+  }
+
+  // L2: БД (переживає рестарт, спільний між інстансами)
   const entry = await getForecastEntry(key, CACHE_TTL_MINUTES);
   if (entry) {
+    stats.inc('forecast_cache_hits_db');
     const ageMin = (Date.now() - new Date(entry.fetched_at).getTime()) / 60000;
     // Якщо найближчим часом активність І кеш старший за IMMINENT_TTL —
     // перечитуємо, щоб час старту був точним. Далекий аутлук кешується спокійно.
     const needFresh = hasNearActivity(entry.payload, SOON_WINDOW_HOURS + 1) &&
       ageMin >= IMMINENT_TTL_MINUTES;
-    if (!needFresh) return entry.payload;
+    if (!needFresh) {
+      memCache.set(key, { payload: entry.payload, fetchedAt: new Date(entry.fetched_at).getTime() });
+      return entry.payload;
+    }
   }
 
   const data = await fetchForecast(lat, lon);
-  if (data) await setCachedForecast(key, lat, lon, data);
+  if (data) {
+    stats.inc('forecast_fetches');
+    await setCachedForecast(key, lat, lon, data);
+    memCache.set(key, { payload: data, fetchedAt: Date.now() });
+  }
   return data;
 }
 
-async function fetchForecast(lat, lon) {
+async function fetchOnce(lat, lon) {
   const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat.toFixed(4)}` +
     `&longitude=${lon.toFixed(4)}` +
     `&hourly=weather_code,wind_gusts_10m,precipitation,precipitation_probability` +
     `&minutely_15=precipitation&forecast_minutely_15=96&forecast_days=${FORECAST_DAYS}` +
     `&timezone=${encodeURIComponent(process.env.TIMEZONE || 'Europe/Kyiv')}`;
 
-  try {
-    const res = await fetch(url, { timeout: 20000 });
-    if (!res.ok) {
-      console.error(`Open-Meteo HTTP ${res.status}`);
-      return null;
+  const res = await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+  if (!res.ok) throw new Error(`Open-Meteo HTTP ${res.status}`);
+  return res.json();
+}
+
+// Ретраї з лінійним backoff: разові мережеві спайки не зривають цикл.
+async function fetchForecast(lat, lon) {
+  let lastErr;
+  for (let attempt = 0; attempt <= FETCH_RETRIES; attempt++) {
+    try {
+      return await fetchOnce(lat, lon);
+    } catch (err) {
+      lastErr = err;
+      stats.inc('forecast_errors');
+      log.warn(`Open-Meteo attempt ${attempt + 1}/${FETCH_RETRIES + 1} failed:`, err.message);
+      if (attempt < FETCH_RETRIES) {
+        await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+      }
     }
-    return await res.json();
-  } catch (err) {
-    console.error('Open-Meteo fetch error:', err.message);
-    return null;
   }
+  log.error('Open-Meteo fetch failed after retries:', lastErr.message);
+  return null;
 }
 
 // Швидка перевірка: чи є в найближчі N годин хоч якась активність

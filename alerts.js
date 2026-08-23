@@ -5,9 +5,12 @@ const {
   markAlertsSentBatch,
   getChatMessages,
   upsertChatMessage,
+  removeSubscriber,
   cleanupOldData
 } = require('./db');
 const { getForecast, analyzeForecast, OUTLOOK_MAX_HOURS } = require('./weather');
+const stats = require('./stats');
+const log = require('./logger');
 
 const SUDDEN_MINUTES = parseInt(process.env.SUDDEN_MINUTES || '60', 10);
 const SEND_CONCURRENCY = parseInt(process.env.SEND_CONCURRENCY || '10', 10);
@@ -155,6 +158,33 @@ function isMessageNotFound(err) {
   return desc.toLowerCase().includes('not found');
 }
 
+// Чат більше не може отримувати повідомлення (бот заблокований/видалений/
+// користувач вийшов) — прибираємо підписника, щоб не витрачати на нього
+// запити до Telegram і БД в кожному циклі.
+function isChatUnavailable(err) {
+  const resp = err && err.response && err.response.body && err.response.body.description;
+  const desc = String((err && err.message) || resp || '').toLowerCase();
+  return (
+    desc.includes('bot was blocked by the user') ||
+    desc.includes('chat not found') ||
+    desc.includes('user is deactivated') ||
+    desc.includes('kicked from')
+  );
+}
+
+async function dropDeadChats(chatIds, errs) {
+  for (const { chatId, err } of errs) {
+    if (!isChatUnavailable(err)) continue;
+    try {
+      await removeSubscriber(chatId);
+      stats.inc('blocked_chats_cleaned');
+      log.info(`Removed unavailable chat ${chatId} from subscribers`);
+    } catch (dbErr) {
+      log.error(`Failed to remove dead chat ${chatId}:`, dbErr.message);
+    }
+  }
+}
+
 async function runPool(items, fn, limit) {
   let cursor = 0;
   async function worker() {
@@ -164,7 +194,7 @@ async function runPool(items, fn, limit) {
         await fn(items[idx]);
       } catch (err) {
         // помилки вже оброблені всередині fn; це страховка
-        console.error('runPool item error:', err.message);
+        log.error('runPool item error:', err.message);
       }
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
@@ -175,6 +205,7 @@ async function runPool(items, fn, limit) {
 
 async function sendRichConcurrently(bot, chatIds, markdown) {
   const sentIds = [];
+  const dead = [];
   let cursor = 0;
   async function worker() {
     while (cursor < chatIds.length) {
@@ -184,13 +215,16 @@ async function sendRichConcurrently(bot, chatIds, markdown) {
         await bot.sendRichMessage(chatId, { markdown });
         sentIds.push(chatId);
       } catch (err) {
-        console.error(`Failed to send rich message to ${chatId}:`, err.message);
+        stats.inc('telegram_send_errors');
+        log.warn(`Failed to send rich message to ${chatId}:`, err.message);
+        dead.push({ chatId, err });
       }
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
   }
   const workers = Array.from({ length: Math.min(SEND_CONCURRENCY, chatIds.length) }, worker);
   await Promise.all(workers);
+  await dropDeadChats(chatIds, dead);
   return sentIds;
 }
 
@@ -213,6 +247,7 @@ async function updateCards(bot, chatIds, analysis) {
   if (ops.length === 0) return;
 
   const updated = [];
+  const dead = [];
   await runPool(ops, async (op) => {
     if (op.existingId != null) {
       try {
@@ -221,11 +256,14 @@ async function updateCards(bot, chatIds, analysis) {
           message_id: op.existingId,
           rich_message: { markdown: content }
         });
+        stats.inc('cards_updated');
         updated.push({ chatId: op.chatId, messageId: op.existingId });
         return;
       } catch (err) {
         if (!isMessageNotFound(err)) {
-          console.error(`Failed to edit card for ${op.chatId}:`, err.message);
+          stats.inc('telegram_send_errors');
+          log.warn(`Failed to edit card for ${op.chatId}:`, err.message);
+          dead.push({ chatId: op.chatId, err });
           return;
         }
         // повідомлення видалено користувачем — надсилаємо нове
@@ -233,15 +271,17 @@ async function updateCards(bot, chatIds, analysis) {
     }
     try {
       const msg = await bot.sendRichMessage(op.chatId, { markdown: content });
+      stats.inc('cards_created');
       updated.push({ chatId: op.chatId, messageId: msg.message_id });
     } catch (err) {
-      console.error(`Failed to send card to ${op.chatId}:`, err.message);
+      stats.inc('telegram_send_errors');
+      log.warn(`Failed to send card to ${op.chatId}:`, err.message);
+      dead.push({ chatId: op.chatId, err });
     }
   }, SEND_CONCURRENCY);
+  await dropDeadChats(ops.map((o) => o.chatId), dead);
 
-  for (const u of updated) {
-    await upsertChatMessage(u.chatId, u.messageId, hash);
-  }
+  await runPool(updated, (u) => upsertChatMessage(u.chatId, u.messageId, hash), SEND_CONCURRENCY);
 }
 
 // Нове 🚨-повідомлення: ураган/град завжди, решта — якщо подія
@@ -265,9 +305,22 @@ async function sendSuddenAlerts(bot, chatIds, analysis) {
   }
 }
 
+let cycleRunning = false;
+let cycleCount = 0;
+
 async function checkAndNotify(bot) {
+  // Захист від накладання циклів: попередній ще не завершився (довгий
+  // Open-Meteo/розсилка) — поточний тік пропускаємо, нічого не втрачаємо.
+  if (cycleRunning) {
+    stats.inc('cron_skipped_overlaps');
+    return;
+  }
+  cycleRunning = true;
   try {
-    await cleanupOldData();
+    // Чистка застарілих записів — раз на годину, а не в кожному циклі.
+    if (++cycleCount % 12 === 1) {
+      await cleanupOldData();
+    }
 
     const clusters = await getSubscriberClusters();
     if (clusters.length === 0) return;
@@ -282,8 +335,11 @@ async function checkAndNotify(bot) {
       await updateCards(bot, chatIds, analysis);
       await sendSuddenAlerts(bot, chatIds, analysis);
     }
+    stats.inc('cron_cycles');
   } catch (err) {
-    console.error('checkAndNotify error:', err);
+    log.error('checkAndNotify error:', err);
+  } finally {
+    cycleRunning = false;
   }
 }
 
