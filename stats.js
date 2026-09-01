@@ -14,7 +14,12 @@ const counters = {
   telegram_send_errors: 0,
   cron_cycles: 0,
   cron_skipped_overlaps: 0,
-  blocked_chats_cleaned: 0
+  blocked_chats_cleaned: 0,
+  radar_fetches: 0,
+  radar_cache_hits: 0,
+  radar_errors: 0,
+  cascade_radar_added: 0,
+  cascade_probability_boosted: 0
 };
 
 const startedAt = Date.now();

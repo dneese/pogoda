@@ -7,6 +7,7 @@ const {
   upsertUserSettings
 } = require('./db');
 const { getForecast, analyzeForecast } = require('./weather');
+const { getRadarAnalysis } = require('./radar');
 const { buildCardContent, KIND_META } = require('./alerts');
 const log = require('./logger');
 
@@ -202,7 +203,12 @@ async function sendWeatherCard(chatId) {
     return;
   }
 
-  const analysis = analyzeForecast(forecast);
+  let radarData = null;
+  try {
+    radarData = await getRadarAnalysis(sub.lat, sub.lon, forecast);
+  } catch (_) { /* радар опціональний */ }
+
+  const analysis = analyzeForecast(forecast, { radarData });
   const markdown = buildCardContent(analysis);
   await bot.sendRichMessage(chatId, { markdown });
 }

@@ -1,4 +1,5 @@
 const { getForecastEntry, setCachedForecast } = require('./db');
+const { getRadarAnalysis, extractMinutelyRadar } = require('./radar');
 const log = require('./logger');
 const stats = require('./stats');
 
@@ -32,11 +33,15 @@ const UV_R = parseFloat(process.env.UV_RED || '11');
 // Класичні пороги дощу (значність події, не колір)
 const RAIN_THRESHOLD_MM = parseFloat(process.env.RAIN_THRESHOLD_MM || '0.3');
 const MIN_RAIN_MM_H = parseFloat(process.env.MIN_RAIN_MM_H || '0.5');
-const MIN_RAIN_DURATION_HOURS = parseFloat(process.env.MIN_RAIN_DURATION_HOURS || '2');
+const MIN_RAIN_DURATION_HOURS = parseFloat(process.env.MIN_RAIN_DURATION_HOURS || '1');
 const HEAVY_RAIN_MM_H = parseFloat(process.env.HEAVY_RAIN_MM_H || '3');
 // «Помірні» явища (спека/мороз/туман/UV) рахуємо значними лише якщо
 // тривають щонайменше N годин — інакше бот шумітиме щодня.
 const MILD_MIN_DURATION_HOURS = parseFloat(process.env.MILD_MIN_DURATION_HOURS || '2');
+
+// Пороги ймовірності опадів з Open-Meteo (для каскадного консенсусу)
+const PROBABILITY_HIGH = parseFloat(process.env.PROBABILITY_HIGH || '70');
+const PROBABILITY_BOOST = parseFloat(process.env.PROBABILITY_BOOST || '1');
 
 const SOON_WINDOW_HOURS = parseFloat(process.env.SOON_WINDOW_HOURS || '3');
 const OUTLOOK_MAX_HOURS = parseFloat(process.env.OUTLOOK_MAX_HOURS || '72');
@@ -123,7 +128,7 @@ async function fetchOnce(lat, lon) {
   const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat.toFixed(4)}` +
     `&longitude=${lon.toFixed(4)}` +
     `&hourly=weather_code,temperature_2m,apparent_temperature,wind_speed_10m,` +
-    `wind_gusts_10m,precipitation,snowfall,uv_index` +
+    `wind_gusts_10m,precipitation,precipitation_probability,snowfall,uv_index` +
     `&minutely_15=precipitation&forecast_minutely_15=96&forecast_days=${FORECAST_DAYS}` +
     `&timezone=${encodeURIComponent(process.env.TIMEZONE || 'Europe/Kyiv')}`;
 
@@ -155,7 +160,7 @@ async function fetchForecast(lat, lon) {
 // (для рішення про «освіження» прогнозу біля події).
 function hasNearActivity(forecastJson, hours) {
   if (!forecastJson || !forecastJson.hourly) return false;
-  const { time, weather_code, precipitation, snowfall } = forecastJson.hourly;
+  const { time, weather_code, precipitation, snowfall, precipitation_probability } = forecastJson.hourly;
   const parse = timeParser(forecastJson);
   const nowMs = Date.now();
   for (let i = 0; i < time.length; i++) {
@@ -164,7 +169,10 @@ function hasNearActivity(forecastJson, hours) {
     const code = weather_code ? weather_code[i] : 0;
     const mm = precipitation ? precipitation[i] : 0;
     const cm = snowfall ? snowfall[i] : 0;
+    const prob = precipitation_probability ? precipitation_probability[i] : 0;
     if (classifyHour(code, 0, mm, cm, 0, 0)) return true;
+    // Висока ймовірність опадів також сигналізує про активність
+    if (prob >= PROBABILITY_HIGH && mm >= RAIN_THRESHOLD_MM) return true;
   }
   return false;
 }
@@ -267,13 +275,15 @@ function findEvents(forecastJson, fromHours, toHours) {
         maxGustMs: run.maxGustMs,
         maxTappC: run.maxTappC,
         minTappC: run.minTappC,
-        maxUv: run.maxUv
+        maxUv: run.maxUv,
+        maxProb: run.maxProb
       });
     }
     run = null;
   }
 
   for (let i = 0; i < H.time.length; i++) {
+    const prob = hourlyVal(H.precipitation_probability, i, 0);
     const cls = classifyHour(
       hourlyVal(H.weather_code, i, 0),
       hourlyVal(H.wind_gusts_10m, i, 0) / 3.6, // км/год → м/с
@@ -296,7 +306,8 @@ function findEvents(forecastJson, fromHours, toHours) {
           maxGustMs: gust,
           maxTappC: tapp,
           minTappC: tapp,
-          maxUv: hourlyVal(H.uv_index, i, 0)
+          maxUv: hourlyVal(H.uv_index, i, 0),
+          maxProb: prob
         };
       } else {
         run.endIdx = i;
@@ -308,12 +319,20 @@ function findEvents(forecastJson, fromHours, toHours) {
         run.maxTappC = Math.max(run.maxTappC, tapp);
         run.minTappC = Math.min(run.minTappC, tapp);
         run.maxUv = Math.max(run.maxUv, hourlyVal(H.uv_index, i, 0));
+        run.maxProb = Math.max(run.maxProb, prob);
       }
     } else {
       flushRun();
     }
   }
   flushRun();
+
+  // Буст ймовірності: якщо висока ймовірність опадів — підвищуємо severity
+  for (const run of runs) {
+    if (run.kind === 'rain' && run.maxProb >= PROBABILITY_HIGH) {
+      run.severity = Math.min(3, run.severity + PROBABILITY_BOOST);
+    }
+  }
 
   const fromMs = nowMs + fromHours * 3600000;
   const toMs = nowMs + toHours * 3600000;
@@ -345,16 +364,23 @@ function refineOnset(event, forecastJson) {
 
 // Головна аналітика для картки: розбиває події на «іміджент» (старт в
 // межах SOON_WINDOW_HOURS) та «аутлук» (старт у межах OUTLOOK_MAX_HOURS).
+// Приймає опціональний radarData для каскадного злиття.
 function analyzeForecast(forecastJson, opts = {}) {
   const soonHours = opts.soonWindowHours != null ? opts.soonWindowHours : SOON_WINDOW_HOURS;
   const maxHours = opts.maxHours != null ? opts.maxHours : OUTLOOK_MAX_HOURS;
+  const radarData = opts.radarData || null;
   const nowMs = Date.now();
   const now = new Date(nowMs);
 
-  const events = findEvents(forecastJson, -1, maxHours).map((ev) => ({
+  let events = findEvents(forecastJson, -1, maxHours).map((ev) => ({
     ...ev,
     onset: refineOnset(ev, forecastJson)
   }));
+
+  // Каскадне злиття: радарні дані + прогноз + ймовірність
+  if (radarData) {
+    events = mergeCascade(events, radarData, forecastJson);
+  }
 
   const imminent = [];
   const outlook = [];
@@ -370,18 +396,133 @@ function analyzeForecast(forecastJson, opts = {}) {
   return { imminent, outlook, now };
 }
 
+// --- Каскадне злиття: радар + прогноз + ймовірність -----------------
+// Логіка консенсусу:
+// 1. Радарні дані (minutely_15) — істина для 0-2 годин
+// 2. Прогнозні події — основа для всіх горизонтів
+// 3. Якщо радар бачить дощ, а прогноз ні → радарний сигнал додається
+// 4. Якщо обидва бачать → max(severity)
+// 5. Висока ймовірність (>= 70%) підвищує severityrain подій
+function mergeCascade(forecastEvents, radarData, forecastJson) {
+  if (!radarData || !radarData.hasData) return forecastEvents;
+
+  const nowMs = Date.now();
+  const radarHorizonMs = nowMs + 2 * 3600000;
+  const merged = [...forecastEvents];
+
+  // Конвертуємо радарні слоти в «події»
+  if (radarData.slots && radarData.slots.length > 0) {
+    // Знаходимо безперервні періоди радарних опадів
+    const rainRuns = buildRadarRuns(radarData.slots);
+
+    for (const radarRun of rainRuns) {
+      const radarMmH = radarRun.maxMmH;
+      if (radarMmH < MIN_RAIN_MM_H * 0.5) continue; // занадто слабкий сигнал
+
+      // Шукаємо перетин з прогнозними подіями
+      let found = false;
+      for (let i = 0; i < merged.length; i++) {
+        const ev = merged[i];
+        if (ev.kind !== 'rain') continue;
+        const overlap = ev.startTime.getTime() < radarRun.endTimeMs &&
+                         ev.endTime.getTime() > radarRun.startTimeMs;
+        if (overlap) {
+          // Злиття: беремо max severity та max інтенсивність
+          const radarSev = severityByThresholds(radarMmH, MIN_RAIN_MM_H, RAIN_O_MM_H, RAIN_R_MM_H);
+          merged[i] = {
+            ...ev,
+            severity: Math.max(ev.severity, Math.max(1, radarSev)),
+            maxMm: Math.max(ev.maxMm, radarMmH),
+            source: 'cascade'
+          };
+          found = true;
+          break;
+        }
+      }
+
+      // Радар бачить дощ, якого немає в прогнозі → додаємо як подію
+      if (!found) {
+        const radarSev = severityByThresholds(radarMmH, MIN_RAIN_MM_H, RAIN_O_MM_H, RAIN_R_MM_H);
+        merged.push({
+          kind: 'rain',
+          category: 'precip',
+          severity: Math.max(1, radarSev),
+          startTime: new Date(radarRun.startTimeMs),
+          endTime: new Date(radarRun.endTimeMs),
+          maxMm: radarMmH,
+          maxSnowCm: 0,
+          maxGustMs: 0,
+          maxTappC: 0,
+          minTappC: 0,
+          maxUv: 0,
+          maxProb: 0,
+          onset: new Date(radarRun.startTimeMs),
+          source: 'radar'
+        });
+        stats.inc('cascade_radar_added');
+      }
+    }
+  }
+
+  // Буст ймовірності для прогнозних подій
+  for (let i = 0; i < merged.length; i++) {
+    const ev = merged[i];
+    if (ev.kind === 'rain' && ev.source !== 'radar') {
+      const prob = ev.maxProb || 0;
+      if (prob >= PROBABILITY_HIGH) {
+        const boosted = Math.min(3, ev.severity + PROBABILITY_BOOST);
+        if (boosted > ev.severity) {
+          merged[i] = { ...ev, severity: boosted, source: 'cascade' };
+          stats.inc('cascade_probability_boosted');
+        }
+      }
+    }
+  }
+
+  merged.sort((a, b) => a.startTime - b.startTime);
+  return merged;
+}
+
+// Будує безперервні «рани» з радарних слотів
+function buildRadarRuns(slots) {
+  if (!slots || slots.length === 0) return [];
+  const runs = [];
+  let run = null;
+
+  for (const slot of slots) {
+    if (slot.mmH >= MIN_RAIN_MM_H * 0.5) {
+      if (!run) {
+        run = { startTimeMs: slot.timeMs, endTimeMs: slot.timeMs + 900000, maxMmH: slot.mmH };
+      } else {
+        run.endTimeMs = slot.timeMs + 900000;
+        if (slot.mmH > run.maxMmH) run.maxMmH = slot.mmH;
+      }
+    } else {
+      if (run) {
+        runs.push(run);
+        run = null;
+      }
+    }
+  }
+  if (run) runs.push(run);
+  return runs;
+}
+
 module.exports = {
   getForecast,
   analyzeForecast,
   findEvents,
   classifyHour,
   clusterKeyOf,
+  mergeCascade,
   CATEGORY_OF,
   KIND_PRIORITY,
   RAIN_THRESHOLD_MM,
   MIN_RAIN_MM_H,
   MIN_RAIN_DURATION_HOURS,
   HEAVY_RAIN_MM_H,
+  PROBABILITY_HIGH,
+  PROBABILITY_BOOST,
   SOON_WINDOW_HOURS,
   OUTLOOK_MAX_HOURS
 };

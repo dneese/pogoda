@@ -21,6 +21,13 @@ Module.prototype.require = function (id) {
       pool: { query: async () => ({ rows: [] }) }
     };
   }
+  if (id === './radar') {
+    return {
+      getRadarAnalysis: async () => ({ hasData: false, confirmed: false, riskScore: 0 }),
+      extractMinutelyRadar: () => ({ hasData: false, slots: [], maxMmH: 0, totalMm: 0 }),
+      checkRadarAvailability: async () => ({ available: false, timestamp: null })
+    };
+  }
   return orig.call(this, id);
 };
 
@@ -61,6 +68,12 @@ function hourlyFixture() {
         const a = fill(0);
         a[10] = 18; // червоний рівень дощу
         a[11] = 9;  // оранжевий
+        return a;
+      })()),
+      precipitation_probability: Object.assign(fill(0), (() => {
+        const a = fill(0);
+        a[10] = 90; // висока ймовірність при сильному дощі
+        a[11] = 80;
         return a;
       })()),
       snowfall: fill(0),
@@ -148,6 +161,31 @@ const blockedCat = alerts.isEventAllowed(
   new Date()
 );
 check('подія вимкненої категорії блокується', blockedCat === false);
+
+// --- Каскадний консенсус: радар + ймовірність ---
+const cascadeEvents = weather.mergeCascade(
+  [{ kind: 'rain', severity: 1, startTime: new Date(), endTime: new Date(Date.now() + 3600000), maxMm: 2, maxProb: 85 }],
+  { hasData: true, slots: [{ timeMs: Date.now() + 600000, mmH: 5 }], maxMmH: 5, activeSlots: 2 },
+  fx
+);
+check('каскад: радар підвищує severity дощу', cascadeEvents[0].severity >= 2);
+
+const cascadeNoRadar = weather.mergeCascade(
+  [{ kind: 'rain', severity: 1, startTime: new Date(), endTime: new Date(Date.now() + 3600000), maxMm: 2, maxProb: 30 }],
+  { hasData: false },
+  fx
+);
+check('каскад: низька ймовірність — без змін', cascadeNoRadar[0].severity === 1);
+
+// Тест analyzeForecast з radarData
+const analysisWithRadar = weather.analyzeForecast(fx, {
+  radarData: { hasData: true, slots: [{ timeMs: Date.now() + 600000, mmH: 8 }], maxMmH: 8, activeSlots: 3 }
+});
+check('analyzeForecast з радаром працює', Array.isArray(analysisWithRadar.imminent));
+
+// Тест нових констант
+check('PROBABILITY_HIGH експортується', typeof weather.PROBABILITY_HIGH === 'number');
+check('PROBABILITY_BOOST експортується', typeof weather.PROBABILITY_BOOST === 'number');
 
 console.log(failed ? `\n${failed} FAILED` : '\nALL PASS');
 process.exit(failed ? 1 : 0);

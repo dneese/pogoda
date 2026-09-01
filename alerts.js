@@ -10,6 +10,7 @@ const {
   cleanupOldData
 } = require('./db');
 const { getForecast, analyzeForecast, OUTLOOK_MAX_HOURS } = require('./weather');
+const { getRadarAnalysis } = require('./radar');
 const stats = require('./stats');
 const log = require('./logger');
 
@@ -445,7 +446,15 @@ async function checkAndNotify(bot) {
       const forecast = await getForecast(lat, lon);
       if (!forecast) continue;
 
-      const analysis = analyzeForecast(forecast);
+      // Каскад: радар + прогноз + ймовірність
+      let radarData = null;
+      try {
+        radarData = await getRadarAnalysis(lat, lon, forecast);
+      } catch (radarErr) {
+        log.debug(`Radar analysis failed for cluster ${lat},${lon}:`, radarErr.message);
+      }
+
+      const analysis = analyzeForecast(forecast, { radarData });
       await updateCards(bot, chatIds, analysis);
       await sendSuddenAlerts(bot, chatIds, analysis);
     }
