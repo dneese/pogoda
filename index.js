@@ -87,7 +87,11 @@ const server = app.listen(PORT, async () => {
 });
 
 let cronJob = null;
-cronJob = cron.schedule('*/5 * * * *', () => {
+// Інтервал перевірки конфігурується через env CHECK_CRON (node-cron format).
+// За замовчуванням — раз на 15 хвилин, достатньо для погоди і в рази дешевше
+// ніж кожні 5 хв (менше активних CPU-секунд = менший рахунок).
+const CHECK_CRON = process.env.CHECK_CRON || '*/15 * * * *';
+cronJob = cron.schedule(CHECK_CRON, () => {
   log.debug('[cron] Перевірка погоди для всіх підписників...');
   checkAndNotify(bot).catch((err) => log.error('[cron] cycle failed:', err.message));
 });
